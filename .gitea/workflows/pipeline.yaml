@@ -10,22 +10,41 @@ jobs:
       matrix:
         toolchain:
           # - stable
-          - beta
-          # - nightly
+          # - beta
+          - nightly
     steps:
-      - run: apt update && apt install -y libasound2-dev libudev-dev cloc
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: ${{ matrix.toolchain }}
           components: rustfmt, clippy
-      - run: cloc src
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check
-      - run: cargo fmt --all -- --check
-      - run: cargo clippy -- -D warnings
-      - run: cargo build
-      - run: cargo test --features ci
+
+      # Install eBPF linker (needed for io-scope-ebpf)
+      - name: Install bpf-linker
+        run: cargo install bpf-linker
+
+      # ---- Userspace build (io-scope) ----
+      - name: Userspace check
+        run: cargo -Z unstable-options -C io-scope check
+
+      - name: Userspace format check
+        run: cargo -Z unstable-options -C io-scope fmt --all -- --check
+
+      - name: Userspace clippy
+        run: cargo -Z unstable-options -C io-scope clippy -- -D warnings
+
+      - name: Userspace build
+        run: cargo -Z unstable-options -C io-scope build
+
+      - name: Userspace tests
+        run: cargo -Z unstable-options -C io-scope test --features ci
+
+      # ---- eBPF build (io-scope-ebpf) ----
+      - name: eBPF build
+        run: cargo -Z unstable-options -C io-scope-ebpf build-ebpf
+        # Assumes io-scope-ebpf/.cargo/config.toml defines:
+        # [alias] build-ebpf = "build -Z build-std=core"
   
   markdown:
     name: Markdown lint

@@ -3,6 +3,7 @@ use clap::ValueEnum;
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum Backend {
     Ptrace,
+    #[cfg(feature = "ebpf")]
     Ebpf,
 }
 

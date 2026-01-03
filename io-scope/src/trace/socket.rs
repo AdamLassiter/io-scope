@@ -12,8 +12,8 @@ pub struct SocketEndpoint {
     remote: String, // "ip:port"
 }
 
-pub type SocketTable = HashMap<u64, SocketEndpoint>; // inode -> endpoint
-//
+pub type SocketTable = HashMap<u64, SocketEndpoint>;
+
 fn classify_fd_path(path: &str) -> ResourceKind {
     if path.starts_with("socket:[") {
         ResourceKind::Socket

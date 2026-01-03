@@ -11,16 +11,17 @@ use anyhow::{Result, bail};
 use libc;
 use time::OffsetDateTime;
 
-#[cfg(target_os = "linux")]
-use crate::trace::socket::SocketTable;
 use crate::{
     agg::Aggregator,
     model::{
         agg::LiveState,
         cli::RunConfig,
-        syscall::{SyscallEvent, SyscallKind},
+        syscall::{ResourceKind, SyscallEvent, SyscallKind},
     },
-    trace::{TraceProvider, socket::resolve_fd_info},
+    trace::{
+        TraceProvider,
+        socket::{SocketTable, resolve_fd_info},
+    },
 };
 
 pub struct PtraceTracer;
@@ -31,26 +32,17 @@ impl PtraceTracer {
     }
 }
 
-impl TraceProvider for PtraceTracer {
-    fn run<A: Aggregator>(
+impl<A: Aggregator> TraceProvider<A> for PtraceTracer {
+    fn run(
         &mut self,
         cfg: &RunConfig,
         agg: &mut A,
         live_state: Option<Arc<Mutex<LiveState>>>,
     ) -> Result<()> {
-        #[cfg(not(target_os = "linux"))]
-        {
-            bail!("PtraceTracer is only supported on Linux.");
-        }
-
-        #[cfg(target_os = "linux")]
-        {
-            run_linux_ptrace_raw(cfg, agg, live_state)
-        }
+        run_linux_ptrace_raw(cfg, agg, live_state)
     }
 }
 
-#[cfg(target_os = "linux")]
 fn run_linux_ptrace_raw<A: Aggregator>(
     cfg: &RunConfig,
     agg: &mut A,
@@ -101,7 +93,6 @@ fn run_linux_ptrace_raw<A: Aggregator>(
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
 fn child_exec(
     cfg: &RunConfig,
     use_pipes: bool,
@@ -174,11 +165,8 @@ fn child_exec(
     }
 }
 
-#[cfg(target_os = "linux")]
 fn parent_trace<A: Aggregator>(child_pid: libc::pid_t, agg: &mut A) -> Result<()> {
     unsafe {
-        use crate::model::syscall::ResourceKind;
-
         let mut status: libc::c_int = 0;
 
         // Track fd -> path per traced pid

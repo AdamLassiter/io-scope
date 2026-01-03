@@ -20,7 +20,6 @@ use crate::{
         agg::LiveState,
         cli::{RunConfig, RunMode},
     },
-    trace::TraceProvider,
     ui::report,
 };
 
