@@ -1,0 +1,10 @@
+# Ignore all hidden files
+.*
+
+# Rust-specific
+target
+Cargo.lock
+
+# SQLite-specific
+*.db
+*.db-journal
