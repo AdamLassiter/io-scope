@@ -132,7 +132,7 @@ pub fn run_live_tui(state: Arc<Mutex<LiveState>>) -> Result<()> {
 }
 
 fn draw_frame(frame: &mut Frame, state: LiveState, current_tab: Tab) {
-    let size: Rect = frame.size();
+    let size: Rect = frame.area();
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
