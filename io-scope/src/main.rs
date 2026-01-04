@@ -1,5 +1,4 @@
 mod agg;
-mod cli;
 mod model;
 mod trace;
 mod ui;
@@ -11,7 +10,7 @@ use std::{
 
 use anyhow::Result;
 use clap::Parser;
-use cli::Cli;
+use model::cli::Cli;
 use trace::build_tracer;
 
 use crate::{

@@ -24,27 +24,25 @@ jobs:
       - name: Install bpf-linker
         run: cargo install bpf-linker
 
-      # ---- Userspace build (io-scope) ----
-      - name: Userspace check
-        run: cargo -Z unstable-options -C io-scope check
-
-      - name: Userspace format check
-        run: cargo -Z unstable-options -C io-scope fmt --all -- --check
-
-      - name: Userspace clippy
-        run: cargo -Z unstable-options -C io-scope clippy -- -D warnings
-
-      - name: Userspace build
-        run: cargo -Z unstable-options -C io-scope build
-
-      - name: Userspace tests
-        run: cargo -Z unstable-options -C io-scope test --features ci
-
       # ---- eBPF build (io-scope-ebpf) ----
       - name: eBPF build
         run: cargo -Z unstable-options -C io-scope-ebpf build-ebpf
-        # Assumes io-scope-ebpf/.cargo/config.toml defines:
-        # [alias] build-ebpf = "build -Z build-std=core"
+
+      # ---- Userspace build (io-scope) ----
+      - name: Userspace check
+        run: cargo -p io-scope check
+
+      - name: Userspace format check
+        run: cargo -p io-scope fmt --all -- --check
+
+      - name: Userspace clippy
+        run: cargo -p io-scope clippy -- -D warnings
+
+      - name: Userspace build
+        run: cargo -p io-scope build
+
+      - name: Userspace tests
+        run: cargo -p io-scope test --features ci
   
   markdown:
     name: Markdown lint
