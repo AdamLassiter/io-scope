@@ -21,12 +21,19 @@ use ratatui::{
 
 use crate::{
     model::agg::LiveState,
-    ui::{kind::draw_by_kind, logs::draw_log_full, paths::draw_paths, summary::draw_summary},
+    ui::{
+        kind::draw_by_kind,
+        logs::draw_log_full,
+        paths::draw_paths,
+        summary::draw_summary,
+        timeline::draw_timeline,
+    },
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tab {
     Summary,
+    Timeline,
     Logs,
     Kind,
     Paths,
@@ -34,12 +41,19 @@ enum Tab {
 
 impl Tab {
     fn all() -> &'static [Tab] {
-        &[Tab::Summary, Tab::Logs, Tab::Kind, Tab::Paths]
+        &[
+            Tab::Summary,
+            Tab::Timeline,
+            Tab::Logs,
+            Tab::Kind,
+            Tab::Paths,
+        ]
     }
 
     fn title(self) -> &'static str {
         match self {
             Tab::Summary => "Summary",
+            Tab::Timeline => "Timeline",
             Tab::Logs => "Logs",
             Tab::Kind => "Kind",
             Tab::Paths => "Paths",
@@ -49,24 +63,26 @@ impl Tab {
     fn index(self) -> usize {
         match self {
             Tab::Summary => 0,
-            Tab::Logs => 1,
-            Tab::Kind => 2,
-            Tab::Paths => 3,
+            Tab::Timeline => 1,
+            Tab::Logs => 2,
+            Tab::Kind => 3,
+            Tab::Paths => 4,
         }
     }
 
     fn from_index(i: usize) -> Self {
         match i {
             0 => Tab::Summary,
-            1 => Tab::Logs,
-            2 => Tab::Kind,
-            3 => Tab::Paths,
+            1 => Tab::Timeline,
+            2 => Tab::Logs,
+            3 => Tab::Kind,
+            4 => Tab::Paths,
             _ => Tab::Summary,
         }
     }
 
     fn count() -> usize {
-        4
+        5
     }
 }
 
@@ -108,12 +124,14 @@ pub fn run_live_tui(state: Arc<Mutex<LiveState>>) -> Result<()> {
                 }
 
                 KeyCode::Char('1') => current_tab = Tab::Summary,
-                KeyCode::Char('2') => current_tab = Tab::Logs,
-                KeyCode::Char('3') => current_tab = Tab::Kind,
-                KeyCode::Char('4') => current_tab = Tab::Paths,
+                KeyCode::Char('2') => current_tab = Tab::Timeline,
+                KeyCode::Char('3') => current_tab = Tab::Logs,
+                KeyCode::Char('4') => current_tab = Tab::Kind,
+                KeyCode::Char('5') => current_tab = Tab::Paths,
 
                 // optional mnemonic keys
                 KeyCode::Char('s') => current_tab = Tab::Summary,
+                KeyCode::Char('t') => current_tab = Tab::Timeline,
                 KeyCode::Char('l') => current_tab = Tab::Logs,
                 KeyCode::Char('k') => current_tab = Tab::Kind,
                 KeyCode::Char('p') => current_tab = Tab::Paths,
@@ -149,6 +167,7 @@ fn draw_frame(frame: &mut Frame, state: LiveState, current_tab: Tab) {
 
     match current_tab {
         Tab::Summary => draw_summary(frame, chunks[1], &state),
+        Tab::Timeline => draw_timeline(frame, chunks[1], &state),
         Tab::Logs => draw_log_full(frame, chunks[1], &state),
         Tab::Kind => draw_by_kind(frame, chunks[1], &state),
         Tab::Paths => draw_paths(frame, chunks[1], &state),
@@ -176,7 +195,7 @@ fn draw_tabs(frame: &mut Frame, area: Rect, current_tab: Tab) {
     let tabs = Tabs::new(titles)
         .block(
             Block::default()
-                .title("io-scope (←/→, 1–4, s/l/k/p)")
+                .title("io-scope (←/→, 1–4, s/t/l/k/p)")
                 .borders(Borders::ALL),
         )
         .highlight_style(

@@ -4,3 +4,4 @@ mod logs;
 mod paths;
 pub mod report;
 mod summary;
+mod timeline;

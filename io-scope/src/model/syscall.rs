@@ -6,7 +6,6 @@ pub enum ResourceKind {
     Socket,
     Pipe,
     Tty,
-    Other,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]

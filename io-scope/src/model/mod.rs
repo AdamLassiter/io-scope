@@ -5,3 +5,4 @@ pub mod pattern;
 pub mod phase;
 pub mod socket;
 pub mod syscall;
+pub mod bin;

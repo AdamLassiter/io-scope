@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use time::{Duration, OffsetDateTime};
 
 use crate::{
@@ -12,25 +10,14 @@ use crate::{
     },
     model::{
         agg::RunSummary,
-        path::PathStats,
-        socket::SocketStats,
-        syscall::{ResourceKind, SyscallEvent, SyscallKind, SyscallStats},
+        bin::{AggregatedTotals, TimeBin},
+        syscall::{ResourceKind, SyscallEvent, SyscallKind},
     },
 };
 
-#[derive(Debug, Clone, Default)]
-pub struct TimeBin {
-    pub syscalls: u64,
-    pub bytes: u64,
-}
-
 pub struct SummaryAggregator {
-    total_syscalls: u64,
     start: Option<OffsetDateTime>,
     end: Option<OffsetDateTime>,
-    by_kind: HashMap<SyscallKind, SyscallStats>,
-    by_path: HashMap<String, PathStats>,
-    by_socket: HashMap<String, SocketStats>,
     bucket: Duration,
     bins: Vec<TimeBin>,
 }
@@ -38,62 +25,74 @@ pub struct SummaryAggregator {
 impl SummaryAggregator {
     pub fn new() -> Self {
         Self {
-            total_syscalls: 0,
             start: None,
             end: None,
-            by_kind: HashMap::new(),
-            by_path: HashMap::new(),
-            by_socket: HashMap::new(),
             bucket: Duration::milliseconds(200),
             bins: Vec::new(),
         }
     }
 
-    /// Build a RunSummary snapshot from current state.
-    /// cmdline will be filled by the caller (as in finalize()).
-    pub fn snapshot(&self) -> RunSummary {
-        let start = self.start.unwrap_or_else(OffsetDateTime::now_utc);
-        let end = self.end.unwrap_or_else(OffsetDateTime::now_utc);
-
-        let pattern_hints = build_pattern_hints(&self.by_kind, &self.by_path);
-        let phases = build_phases(start, self.bucket, &self.bins);
-
-        RunSummary {
-            cmdline: String::new(),
-            total_syscalls: self.total_syscalls,
-            start,
-            end,
-            by_kind: self.by_kind.clone(),
-            by_path: self.by_path.clone(),
-            pattern_hints,
-            phases,
-            by_socket: self.by_socket.clone(), // NEW
+    fn bin_index(&self, ts: OffsetDateTime) -> Option<usize> {
+        let start = self.start?;
+        let dt = ts - start;
+        let ms = dt.whole_milliseconds();
+        if ms >= 0 {
+            Some((ms / self.bucket.whole_milliseconds()) as usize)
+        } else {
+            None
         }
     }
-}
 
-impl Aggregator for SummaryAggregator {
-    type Output = RunSummary;
-
-    fn on_start(&mut self) {
-        let now = OffsetDateTime::now_utc();
-        self.start = Some(now);
-        self.end = Some(now);
-        self.bins.clear();
+    fn ensure_bin(&mut self, idx: usize) -> &mut TimeBin {
+        if idx >= self.bins.len() {
+            self.bins.resize_with(idx + 1, TimeBin::default);
+        }
+        &mut self.bins[idx]
     }
 
-    fn on_event(&mut self, event: &SyscallEvent) {
-        self.total_syscalls += 1;
-        self.end = Some(event.ts);
+    pub fn extend_bins_to(&mut self, ts: OffsetDateTime) {
+        let Some(start) = self.start else { return };
+        let dt = ts - start;
+        let ms = dt.whole_milliseconds();
+        if ms < 0 {
+            return;
+        }
 
-        // Per-kind stats: all kinds go here directly
-        let entry = self.by_kind.entry(event.kind).or_default();
-        entry.count += 1;
-        entry.total_bytes += event.bytes;
+        let idx = (ms / self.bucket.whole_milliseconds()) as usize;
+        if idx >= self.bins.len() {
+            self.bins.resize_with(idx + 1, TimeBin::default);
+        }
+        self.end = Some(ts);
+    }
+
+    fn record_event(&mut self, event: &SyscallEvent) {
+        let Some(idx) = self.bin_index(event.ts) else {
+            return;
+        };
+
+        let bin = self.ensure_bin(idx);
+        bin.syscalls += 1;
+
+        // Per-kind stats
+        let kind_entry = bin.by_kind.entry(event.kind).or_default();
+        kind_entry.count += 1;
+        kind_entry.total_bytes += event.bytes;
+
+        // Track bytes for read/write syscalls
+        if is_read_like(event.kind) || is_write_like(event.kind) {
+            bin.bytes += event.bytes;
+
+            // Track by resource kind
+            if let Some(res_kind) = event.resource_kind {
+                let io_entry = bin.by_resource.entry(res_kind).or_default();
+                io_entry.calls += 1;
+                io_entry.bytes += event.bytes;
+            }
+        }
 
         // Files
         if let (Some(path), Some(ResourceKind::File)) = (&event.resource, event.resource_kind) {
-            let p = self.by_path.entry(path.clone()).or_default();
+            let p = bin.by_path.entry(path.clone()).or_default();
             p.bytes += event.bytes;
             if is_read_like(event.kind) {
                 p.reads += 1;
@@ -111,7 +110,7 @@ impl Aggregator for SummaryAggregator {
 
         // Sockets
         if let (Some(peer), Some(ResourceKind::Socket)) = (&event.resource, event.resource_kind) {
-            let s = self.by_socket.entry(peer.clone()).or_default();
+            let s = bin.by_socket.entry(peer.clone()).or_default();
             if is_read_like(event.kind) {
                 s.read_calls += 1;
                 s.read_bytes += event.bytes;
@@ -121,23 +120,51 @@ impl Aggregator for SummaryAggregator {
                 s.write_bytes += event.bytes;
             }
         }
+    }
 
-        // Timeline
-        if let Some(start) = self.start {
-            let dt = event.ts - start;
-            let ms = dt.whole_milliseconds();
-            if ms >= 0 {
-                let idx = (ms / self.bucket.whole_milliseconds()) as usize;
-                if idx >= self.bins.len() {
-                    self.bins.resize(idx + 1, TimeBin::default());
-                }
-                let bin = &mut self.bins[idx];
-                bin.syscalls += 1;
-                if is_read_like(event.kind) || is_write_like(event.kind) {
-                    bin.bytes += event.bytes;
-                }
-            }
+    fn build_summary(&self) -> RunSummary {
+        let start = self.start.unwrap_or_else(OffsetDateTime::now_utc);
+        let end = self.end.unwrap_or_else(OffsetDateTime::now_utc);
+
+        let totals = AggregatedTotals::from_bins(&self.bins);
+        let pattern_hints = build_pattern_hints(&totals);
+        let phases = build_phases(start, self.bucket, &self.bins);
+
+        RunSummary {
+            cmdline: String::new(),
+            total_syscalls: totals.total_syscalls,
+            total_bytes: totals.total_bytes,
+            start: Some(start),
+            end: Some(end),
+            bucket_ms: self.bucket.whole_milliseconds(),
+            bins: self.bins.clone(),
+            by_kind: totals.by_kind,
+            by_path: totals.by_path,
+            by_socket: totals.by_socket,
+            by_resource: totals.by_resource,
+            pattern_hints,
+            phases,
         }
+    }
+
+    pub fn snapshot(&self) -> RunSummary {
+        self.build_summary()
+    }
+}
+
+impl Aggregator for SummaryAggregator {
+    type Output = RunSummary;
+
+    fn on_start(&mut self) {
+        let now = OffsetDateTime::now_utc();
+        self.start = Some(now);
+        self.end = Some(now);
+        self.bins.clear();
+    }
+
+    fn on_event(&mut self, event: &SyscallEvent) {
+        self.end = Some(event.ts);
+        self.record_event(event);
     }
 
     fn on_end(&mut self) {
@@ -146,23 +173,9 @@ impl Aggregator for SummaryAggregator {
         }
     }
 
+    fn tick(&mut self) {}
+
     fn finalize(self) -> Self::Output {
-        let start = self.start.unwrap_or_else(OffsetDateTime::now_utc);
-        let end = self.end.unwrap_or_else(OffsetDateTime::now_utc);
-
-        let pattern_hints = build_pattern_hints(&self.by_kind, &self.by_path);
-        let phases = build_phases(start, self.bucket, &self.bins);
-
-        RunSummary {
-            cmdline: String::new(),
-            total_syscalls: self.total_syscalls,
-            start,
-            end,
-            by_kind: self.by_kind,
-            by_path: self.by_path,
-            pattern_hints,
-            phases,
-            by_socket: self.by_socket,
-        }
+        self.build_summary()
     }
 }

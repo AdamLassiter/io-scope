@@ -3,24 +3,24 @@ use std::collections::{HashMap, VecDeque};
 use time::OffsetDateTime;
 
 use crate::model::{
-    path::PathStats,
-    pattern::PatternHint,
-    phase::Phase,
-    socket::SocketStats,
-    syscall::{SyscallKind, SyscallStats},
+    bin::{IoByKind, TimeBin}, path::PathStats, pattern::PatternHint, phase::Phase, socket::SocketStats, syscall::{ResourceKind, SyscallKind, SyscallStats}
 };
 
 #[derive(Debug, Clone)]
 pub struct RunSummary {
     pub cmdline: String,
     pub total_syscalls: u64,
-    pub start: OffsetDateTime,
-    pub end: OffsetDateTime,
+    pub total_bytes: u64,
+    pub start: Option<OffsetDateTime>,
+    pub end: Option<OffsetDateTime>,
+    pub bucket_ms: i128,
+    pub bins: Vec<TimeBin>,
 
     // Syscall aggregates
     pub by_kind: HashMap<SyscallKind, SyscallStats>,
     pub by_path: HashMap<String, PathStats>,
     pub by_socket: HashMap<String, SocketStats>,
+    pub by_resource: HashMap<ResourceKind, IoByKind>,
 
     // Heuristic analysis results
     pub pattern_hints: Vec<PatternHint>,

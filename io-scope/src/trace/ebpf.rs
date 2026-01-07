@@ -1,12 +1,10 @@
 use std::{
     ffi::CString,
-    io::{BufRead, BufReader},
-    os::fd::FromRawFd,
+    os::fd::OwnedFd,
     sync::{Arc, Mutex},
-    thread,
 };
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 use aya::{
     Ebpf,
     EbpfLoader,
@@ -15,6 +13,13 @@ use aya::{
     util::online_cpus,
 };
 use bytes::BytesMut;
+use nix::{
+    sys::{
+        signal::{Signal, kill, raise},
+        wait::{WaitPidFlag, WaitStatus, waitpid},
+    },
+    unistd::{ForkResult, Pid, close, dup2_stderr, dup2_stdout, execvp, fork, pipe},
+};
 use time::OffsetDateTime;
 
 use crate::{
@@ -27,6 +32,7 @@ use crate::{
     trace::{
         TraceProvider,
         socket::{SocketTable, resolve_fd_info},
+        spawn_log_reader,
     },
 };
 
@@ -69,63 +75,47 @@ impl<A: Aggregator> TraceProvider<A> for EbpfTracer {
 fn child_exec(
     cfg: &RunConfig,
     use_pipes: bool,
-    stdout_pipe: [libc::c_int; 2],
-    stderr_pipe: [libc::c_int; 2],
+    stdout_pipe: Option<(OwnedFd, OwnedFd)>,
+    stderr_pipe: Option<(OwnedFd, OwnedFd)>,
 ) -> ! {
-    unsafe {
+    let result: Result<(), nix::Error> = (|| {
         if use_pipes {
-            if stdout_pipe[1] >= 0 {
-                libc::dup2(stdout_pipe[1], libc::STDOUT_FILENO);
+            if let Some((_, write_fd)) = stdout_pipe.as_ref() {
+                dup2_stdout(write_fd)?;
             }
-            if stderr_pipe[1] >= 0 {
-                libc::dup2(stderr_pipe[1], libc::STDERR_FILENO);
+            if let Some((_, write_fd)) = stderr_pipe.as_ref() {
+                dup2_stderr(write_fd)?;
             }
             // Close all pipe ends in child
-            for &fd in &[stdout_pipe[0], stdout_pipe[1], stderr_pipe[0], stderr_pipe[1]] {
-                if fd >= 0 {
-                    libc::close(fd);
-                }
+            for (read_fd, write_fd) in [stdout_pipe, stderr_pipe].into_iter().flatten() {
+                close(read_fd)?;
+                close(write_fd)?;
             }
         }
 
         // Stop child so parent can attach eBPF
-        libc::raise(libc::SIGSTOP);
+        raise(Signal::SIGSTOP)?;
 
         let c_cmd = CString::new(cfg.cmd.as_str()).unwrap();
-        let c_args: Vec<CString> = cfg
-            .args
-            .iter()
-            .map(|a| CString::new(a.as_str()).unwrap())
-            .collect();
+        let mut c_args: Vec<CString> = vec![c_cmd.clone()];
+        c_args.extend(cfg.args.iter().map(|a| CString::new(a.as_str()).unwrap()));
 
-        let mut argv: Vec<*const libc::c_char> = Vec::with_capacity(c_args.len() + 2);
-        argv.push(c_cmd.as_ptr());
-        for a in &c_args {
-            argv.push(a.as_ptr());
-        }
-        argv.push(std::ptr::null());
+        execvp(&c_cmd, &c_args)?;
+        Ok(())
+    })();
 
-        libc::execvp(c_cmd.as_ptr(), argv.as_ptr());
-        libc::_exit(127);
-    }
+    // If we get here, exec failed
+    let _ = result;
+    std::process::exit(127);
 }
 
-fn check_child_done(child_pid: i32) -> Result<bool> {
-    let mut status: libc::c_int = 0;
-    let res = unsafe { libc::waitpid(child_pid, &mut status, libc::WNOHANG) };
-
-    match res {
-        0 => Ok(false),
-        p if p == child_pid => Ok(libc::WIFEXITED(status) || libc::WIFSIGNALED(status)),
-        -1 => {
-            let errno = std::io::Error::last_os_error().raw_os_error();
-            if errno == Some(libc::ECHILD) {
-                Ok(true)
-            } else {
-                Err(anyhow!("waitpid error: {:?}", errno))
-            }
-        }
-        _ => Ok(false),
+fn check_child_done(child_pid: Pid) -> Result<bool> {
+    match waitpid(child_pid, Some(WaitPidFlag::WNOHANG)) {
+        Ok(WaitStatus::StillAlive) => Ok(false),
+        Ok(WaitStatus::Exited(_, _)) | Ok(WaitStatus::Signaled(_, _, _)) => Ok(true),
+        Ok(_) => Ok(false), // Other states (stopped, continued, etc.)
+        Err(nix::errno::Errno::ECHILD) => Ok(true),
+        Err(e) => Err(anyhow!("waitpid error: {:?}", e)),
     }
 }
 
@@ -141,38 +131,38 @@ fn run_linux_ebpf<A: Aggregator>(
 
     // Set up pipes if in live mode
     let use_pipes = matches!(cfg.mode, RunMode::Live) && live_state.is_some();
-    let mut stdout_pipe: [libc::c_int; 2] = [-1, -1];
-    let mut stderr_pipe: [libc::c_int; 2] = [-1, -1];
-
-    if use_pipes {
-        if unsafe { libc::pipe(stdout_pipe.as_mut_ptr()) } == -1 {
-            bail!("pipe for stdout failed");
-        }
-        if unsafe { libc::pipe(stderr_pipe.as_mut_ptr()) } == -1 {
-            bail!("pipe for stderr failed");
-        }
-    }
+    let stdout_pipe = if use_pipes {
+        Some(pipe().context("pipe for stdout failed")?)
+    } else {
+        None
+    };
+    let stderr_pipe = if use_pipes {
+        Some(pipe().context("pipe for stderr failed")?)
+    } else {
+        None
+    };
 
     // 1) Spawn stopped child process
-    let pid = unsafe { libc::fork() };
-    if pid < 0 {
-        return Err(anyhow!("fork failed"));
-    } else if pid == 0 {
-        child_exec(cfg, use_pipes, stdout_pipe, stderr_pipe);
-    }
-
-    let child_pid = pid;
+    let child_pid = match unsafe { fork() }.context("fork failed")? {
+        ForkResult::Child => {
+            child_exec(cfg, use_pipes, stdout_pipe, stderr_pipe);
+        }
+        ForkResult::Parent { child } => child,
+    };
 
     // Parent: close write ends, spawn log readers
     if use_pipes {
-        unsafe {
-            libc::close(stdout_pipe[1]);
-            libc::close(stderr_pipe[1]);
+        if let Some((read_fd, write_fd)) = stdout_pipe {
+            close(write_fd)?;
+            if let Some(state) = live_state.as_ref() {
+                spawn_log_reader(read_fd, state.clone(), false);
+            }
         }
-
-        if let Some(state) = live_state.as_ref() {
-            spawn_log_reader(stdout_pipe[0], state.clone(), false);
-            spawn_log_reader(stderr_pipe[0], state.clone(), true);
+        if let Some((read_fd, write_fd)) = stderr_pipe {
+            close(write_fd)?;
+            if let Some(state) = live_state.as_ref() {
+                spawn_log_reader(read_fd, state.clone(), true);
+            }
         }
     }
 
@@ -182,7 +172,7 @@ fn run_linux_ebpf<A: Aggregator>(
             .map_mut("TARGET_TGID")
             .ok_or_else(|| anyhow!("BPF map TARGET_TGID not found"))?;
         let mut arr: Array<_, u32> = Array::try_from(map)?;
-        arr.set(0, child_pid as u32, 0)
+        arr.set(0, child_pid.as_raw() as u32, 0)
             .context("failed to set TARGET_TGID")?;
     }
 
@@ -220,7 +210,7 @@ fn run_linux_ebpf<A: Aggregator>(
     let mut slots: Vec<BytesMut> = (0..8).map(|_| BytesMut::with_capacity(4096)).collect();
 
     // 3) Resume child
-    unsafe { libc::kill(child_pid, libc::SIGCONT) };
+    kill(child_pid, Signal::SIGCONT).context("failed to resume child")?;
 
     // 4) Poll perf buffers
     let mut child_done = false;
@@ -252,6 +242,7 @@ fn run_linux_ebpf<A: Aggregator>(
 
         if !child_done {
             child_done = check_child_done(child_pid)?;
+            agg.tick();
         }
 
         if !got_events {
@@ -276,11 +267,11 @@ fn io_event_to_syscall_event(io_ev: &IoEvent) -> SyscallEvent {
         0
     };
 
-    let pid = io_ev.tgid as i32;
+    let pid = Pid::from_raw(io_ev.tgid as i32);
 
     let mut socket_table = SocketTable::new();
     let (resource, resource_kind) = if io_ev.fd >= 0 {
-        resolve_fd_info(pid as libc::pid_t, io_ev.fd, &mut socket_table)
+        resolve_fd_info(pid, io_ev.fd, &mut socket_table)
             .map(|(res, kind)| (Some(res), Some(kind)))
             .unwrap_or((None, None))
     } else {
@@ -288,7 +279,7 @@ fn io_event_to_syscall_event(io_ev: &IoEvent) -> SyscallEvent {
     };
 
     SyscallEvent {
-        pid,
+        pid: pid.as_raw(),
         ts: OffsetDateTime::now_utc(),
         kind,
         fd: Some(io_ev.fd),
@@ -296,26 +287,4 @@ fn io_event_to_syscall_event(io_ev: &IoEvent) -> SyscallEvent {
         resource,
         resource_kind,
     }
-}
-
-fn spawn_log_reader(fd: libc::c_int, state: Arc<Mutex<LiveState>>, is_stderr: bool) {
-    thread::spawn(move || {
-        let file = unsafe { std::fs::File::from_raw_fd(fd) };
-        let reader = BufReader::new(file);
-
-        for line in reader.lines() {
-            let Ok(mut line) = line else { break };
-
-            if is_stderr {
-                line = format!("[stderr] {}", line);
-            }
-
-            let mut s = state.lock().unwrap();
-            const MAX_LOG_LINES: usize = 200;
-            if s.log_lines.len() >= MAX_LOG_LINES {
-                s.log_lines.pop_front();
-            }
-            s.log_lines.push_back(line);
-        }
-    });
 }

@@ -1,26 +1,33 @@
 use std::{
     collections::HashMap,
     ffi::CString,
-    io::{BufRead, BufReader},
-    os::fd::FromRawFd,
+    os::fd::OwnedFd,
     sync::{Arc, Mutex},
-    thread,
 };
 
-use anyhow::{Result, bail};
-use libc;
+use anyhow::{Context, Result};
+use nix::{
+    libc,
+    sys::{
+        ptrace,
+        signal::{Signal, raise},
+        wait::{WaitPidFlag, WaitStatus, waitpid},
+    },
+    unistd::{ForkResult, Pid, close, dup2_stderr, dup2_stdout, execvp, fork, pipe},
+};
 use time::OffsetDateTime;
 
 use crate::{
     agg::Aggregator,
     model::{
         agg::LiveState,
-        cli::RunConfig,
+        cli::{RunConfig, RunMode},
         syscall::{ResourceKind, SyscallEvent, SyscallKind},
     },
     trace::{
         TraceProvider,
         socket::{SocketTable, resolve_fd_info},
+        spawn_log_reader,
     },
 };
 
@@ -48,47 +55,44 @@ fn run_linux_ptrace_raw<A: Aggregator>(
     agg: &mut A,
     live_state: Option<Arc<Mutex<LiveState>>>,
 ) -> Result<()> {
-    use crate::model::cli::RunMode;
-
     agg.on_start();
 
     let use_pipes = matches!(cfg.mode, RunMode::Live) && live_state.is_some();
-    let mut stdout_pipe: [libc::c_int; 2] = [-1, -1];
-    let mut stderr_pipe: [libc::c_int; 2] = [-1, -1];
-    if use_pipes {
-        if unsafe { libc::pipe(stdout_pipe.as_mut_ptr()) } == -1 {
-            bail!("pipe for stdout failed");
-        }
-        if unsafe { libc::pipe(stderr_pipe.as_mut_ptr()) } == -1 {
-            bail!("pipe for stderr failed");
-        }
-    }
-
-    let pid = unsafe { libc::fork() };
-    if pid < 0 {
-        bail!("fork failed");
-    }
-
-    if pid == 0 {
-        // Child
-        child_exec(cfg, use_pipes, stdout_pipe, stderr_pipe);
+    let stdout_pipe = if use_pipes {
+        Some(pipe().context("pipe for stdout failed")?)
     } else {
-        if use_pipes {
-            unsafe {
-                // Close write ends in parent; keep read ends.
-                libc::close(stdout_pipe[1]);
-                libc::close(stderr_pipe[1]);
-            }
+        None
+    };
+    let stderr_pipe = if use_pipes {
+        Some(pipe().context("pipe for stderr failed")?)
+    } else {
+        None
+    };
 
-            if let Some(state) = live_state.clone() {
-                spawn_log_reader(stdout_pipe[0], state.clone(), false);
-                spawn_log_reader(stderr_pipe[0], state, true);
+    let child_pid = match unsafe { fork() }.context("fork failed")? {
+        ForkResult::Child => {
+            child_exec(cfg, use_pipes, stdout_pipe, stderr_pipe);
+        }
+        ForkResult::Parent { child } => child,
+    };
+
+    // Parent: close write ends, spawn log readers
+    if use_pipes {
+        if let Some((read_fd, write_fd)) = stdout_pipe {
+            close(write_fd)?;
+            if let Some(state) = live_state.as_ref() {
+                spawn_log_reader(read_fd, state.clone(), false);
             }
         }
-        // Parent
-        parent_trace(pid, agg)?;
+        if let Some((read_fd, write_fd)) = stderr_pipe {
+            close(write_fd)?;
+            if let Some(state) = live_state.as_ref() {
+                spawn_log_reader(read_fd, state.clone(), true);
+            }
+        }
     }
 
+    parent_trace(child_pid, agg)?;
     agg.on_end();
     Ok(())
 }
@@ -96,210 +100,123 @@ fn run_linux_ptrace_raw<A: Aggregator>(
 fn child_exec(
     cfg: &RunConfig,
     use_pipes: bool,
-    stdout_pipe: [libc::c_int; 2],
-    stderr_pipe: [libc::c_int; 2],
+    stdout_pipe: Option<(OwnedFd, OwnedFd)>,
+    stderr_pipe: Option<(OwnedFd, OwnedFd)>,
 ) -> ! {
-    // Ask to be traced by parent.
-    unsafe {
-        // In live mode, detach child's stdout/stderr from our TUI.
+    let result: Result<(), nix::Error> = (|| {
         if use_pipes {
-            // Redirect stdout/stderr to pipes
-            if stdout_pipe[1] >= 0 {
-                libc::dup2(stdout_pipe[1], libc::STDOUT_FILENO);
+            if let Some((_, write_fd)) = stdout_pipe.as_ref() {
+                dup2_stdout(write_fd)?;
             }
-            if stderr_pipe[1] >= 0 {
-                libc::dup2(stderr_pipe[1], libc::STDERR_FILENO);
+            if let Some((_, write_fd)) = stderr_pipe.as_ref() {
+                dup2_stderr(write_fd)?;
             }
-            // Close both ends in child (we only need the dup'ed fds)
-            if stdout_pipe[0] >= 0 {
-                libc::close(stdout_pipe[0]);
-            }
-            if stdout_pipe[1] >= 0 {
-                libc::close(stdout_pipe[1]);
-            }
-            if stderr_pipe[0] >= 0 {
-                libc::close(stderr_pipe[0]);
-            }
-            if stderr_pipe[1] >= 0 {
-                libc::close(stderr_pipe[1]);
+            // Close all pipe ends in child
+            for (read_fd, write_fd) in [stdout_pipe, stderr_pipe].into_iter().flatten() {
+                close(read_fd)?;
+                close(write_fd)?;
             }
         }
 
-        if libc::ptrace(
-            libc::PTRACE_TRACEME,
-            0,
-            std::ptr::null_mut::<libc::c_void>(),
-            std::ptr::null_mut::<libc::c_void>(),
-        ) == -1
-        {
-            libc::_exit(127);
-        }
+        // Ask to be traced by parent
+        ptrace::traceme()?;
 
-        // Stop ourselves so parent can set options.
-        libc::raise(libc::SIGSTOP);
+        // Stop ourselves so parent can set options
+        raise(Signal::SIGSTOP)?;
 
-        // Build argv for execvp: [cmd, args..., NULL]
-        let c_cmd = match CString::new(cfg.cmd.as_str()) {
-            Ok(c) => c,
-            Err(_) => libc::_exit(127),
-        };
+        let c_cmd = CString::new(cfg.cmd.as_str()).unwrap();
+        let mut c_args: Vec<CString> = vec![c_cmd.clone()];
+        c_args.extend(cfg.args.iter().map(|a| CString::new(a.as_str()).unwrap()));
 
-        let mut c_args: Vec<CString> = Vec::with_capacity(cfg.args.len());
-        for a in &cfg.args {
-            match CString::new(a.as_str()) {
-                Ok(c) => c_args.push(c),
-                Err(_) => libc::_exit(127),
-            }
-        }
+        execvp(&c_cmd, &c_args)?;
+        Ok(())
+    })();
 
-        let mut argv: Vec<*const libc::c_char> = Vec::with_capacity(c_args.len() + 2);
-        argv.push(c_cmd.as_ptr());
-        for a in &c_args {
-            argv.push(a.as_ptr());
-        }
-        argv.push(std::ptr::null());
-
-        libc::execvp(c_cmd.as_ptr(), argv.as_ptr());
-        // If execvp returns, it failed.
-        libc::_exit(127);
-    }
+    let _ = result;
+    std::process::exit(127);
 }
 
-fn parent_trace<A: Aggregator>(child_pid: libc::pid_t, agg: &mut A) -> Result<()> {
-    unsafe {
-        let mut status: libc::c_int = 0;
+fn parent_trace<A: Aggregator>(child_pid: Pid, agg: &mut A) -> Result<()> {
+    // Track fd -> path per traced pid
+    let mut fd_info: HashMap<Pid, HashMap<i32, (String, ResourceKind)>> = HashMap::new();
+    let mut socket_table: SocketTable = SocketTable::new();
 
-        // Track fd -> path per traced pid
-        let mut fd_info: HashMap<libc::pid_t, HashMap<i32, (String, ResourceKind)>> =
-            HashMap::new();
-        // socket inode -> endpoint
-        let mut socket_table: SocketTable = SocketTable::new();
+    // Wait for SIGSTOP from child
+    match waitpid(child_pid, None).context("initial waitpid failed")? {
+        WaitStatus::Exited(_, _) | WaitStatus::Signaled(_, _, _) => return Ok(()),
+        _ => {}
+    }
 
-        // Wait for SIGSTOP from child.
-        if libc::waitpid(child_pid, &mut status, 0) == -1 {
-            bail!("waitpid failed");
-        }
+    // Set ptrace options
+    ptrace::setoptions(
+        child_pid,
+        ptrace::Options::PTRACE_O_TRACESYSGOOD
+            | ptrace::Options::PTRACE_O_TRACECLONE
+            | ptrace::Options::PTRACE_O_TRACEFORK
+            | ptrace::Options::PTRACE_O_TRACEEXEC
+            | ptrace::Options::PTRACE_O_TRACEEXIT
+            | ptrace::Options::PTRACE_O_TRACEVFORK,
+    )
+    .context("PTRACE_SETOPTIONS failed")?;
 
-        if libc::WIFEXITED(status) || libc::WIFSIGNALED(status) {
-            return Ok(());
-        }
+    // Start tracing syscalls
+    ptrace::syscall(child_pid, None).context("initial PTRACE_SYSCALL failed")?;
 
-        // Set ptrace options.
-        if libc::ptrace(
-            libc::PTRACE_SETOPTIONS,
-            child_pid,
-            std::ptr::null_mut::<libc::c_void>(),
-            ((libc::PTRACE_O_TRACESYSGOOD
-                | libc::PTRACE_O_TRACECLONE
-                | libc::PTRACE_O_TRACEFORK
-                | libc::PTRACE_O_TRACEEXEC
-                | libc::PTRACE_O_TRACEEXIT
-                | libc::PTRACE_O_TRACEVFORK
-                | libc::PTRACE_O_TRACEVFORKDONE
-                | libc::PTRACE_O_TRACESECCOMP) as libc::c_long) as *mut libc::c_void,
-        ) == -1
-        {
-            bail!("PTRACE_SETOPTIONS failed");
-        }
+    let mut in_syscall = false;
 
-        // Start tracing syscalls.
-        if libc::ptrace(
-            libc::PTRACE_SYSCALL,
-            child_pid,
-            std::ptr::null_mut::<libc::c_void>(),
-            std::ptr::null_mut::<libc::c_void>(),
-        ) == -1
-        {
-            bail!("initial PTRACE_SYSCALL failed");
-        }
+    loop {
+        let status = waitpid(child_pid, Some(WaitPidFlag::WNOHANG)).context("waitpid failed inside loop")?;
 
-        let mut in_syscall = false;
+        match status {
+            WaitStatus::Exited(_, _) | WaitStatus::Signaled(_, _, _) => break,
+            WaitStatus::PtraceSyscall(_) => {
+                if in_syscall {
+                    // Syscall exit: decode and emit event
+                    let regs = ptrace::getregs(child_pid).context("PTRACE_GETREGS failed")?;
 
-        loop {
-            let w = libc::waitpid(child_pid, &mut status, 0);
-            if w == -1 {
-                bail!("waitpid failed inside loop");
-            }
+                    if let Some(mut ev) = decode_syscall_exit(child_pid, &regs) {
+                        if let Some(fd) = ev.fd {
+                            let pid_map = fd_info.entry(child_pid).or_default();
 
-            if libc::WIFEXITED(status) || libc::WIFSIGNALED(status) {
-                break;
-            }
-
-            if libc::WIFSTOPPED(status) {
-                let sig = libc::WSTOPSIG(status);
-                let is_syscall_stop = sig == (libc::SIGTRAP | 0x80);
-
-                if is_syscall_stop {
-                    if in_syscall {
-                        // Syscall exit: decode and emit event.
-                        let mut regs: libc::user_regs_struct = std::mem::zeroed();
-                        if libc::ptrace(
-                            libc::PTRACE_GETREGS,
-                            child_pid,
-                            std::ptr::null_mut::<libc::c_void>(),
-                            &mut regs as *mut _ as *mut libc::c_void,
-                        ) == -1
-                        {
-                            bail!("PTRACE_GETREGS failed");
-                        }
-
-                        if let Some(mut ev) = decode_syscall_exit(child_pid, &regs) {
-                            if let Some(fd) = ev.fd {
-                                use crate::model::syscall::SyscallKind;
-
-                                let pid_map = fd_info.entry(child_pid).or_default();
-
-                                match ev.kind {
-                                    SyscallKind::Close => {
-                                        // Drop mapping on close
-                                        pid_map.remove(&fd);
-                                    }
-                                    _ => {
-                                        // Ensure we have fd info (path, kind)
-                                        if !pid_map.contains_key(&fd)
-                                            && let Some((path, kind)) =
-                                                resolve_fd_info(child_pid, fd, &mut socket_table)
+                            match ev.kind {
+                                SyscallKind::Close => {
+                                    pid_map.remove(&fd);
+                                }
+                                _ => {
+                                    if !pid_map.contains_key(&fd)
+                                        && let Some((path, kind)) =
+                                            resolve_fd_info(child_pid, fd, &mut socket_table)
                                         {
                                             pid_map.insert(fd, (path, kind));
                                         }
-                                        if let Some((path, kind)) = pid_map.get(&fd) {
-                                            ev.resource = Some(path.clone());
-                                            ev.resource_kind = Some(*kind);
-                                        }
+                                    if let Some((path, kind)) = pid_map.get(&fd) {
+                                        ev.resource = Some(path.clone());
+                                        ev.resource_kind = Some(*kind);
                                     }
                                 }
                             }
-
-                            agg.on_event(&ev);
                         }
 
-                        in_syscall = false;
-                    } else {
-                        in_syscall = true;
+                        agg.on_event(&ev);
                     }
 
-                    // Continue to next syscall stop.
-                    if libc::ptrace(
-                        libc::PTRACE_SYSCALL,
-                        child_pid,
-                        std::ptr::null_mut::<libc::c_void>(),
-                        std::ptr::null_mut::<libc::c_void>(),
-                    ) == -1
-                    {
-                        bail!("PTRACE_SYSCALL failed (syscall-stop)");
-                    }
+                    in_syscall = false;
                 } else {
-                    // Other signal: pass through.
-                    if libc::ptrace(
-                        libc::PTRACE_SYSCALL,
-                        child_pid,
-                        std::ptr::null_mut::<libc::c_void>(),
-                        (sig as libc::c_long) as *mut libc::c_void,
-                    ) == -1
-                    {
-                        bail!("PTRACE_SYSCALL failed (signal)");
-                    }
+                    in_syscall = true;
                 }
+
+                ptrace::syscall(child_pid, None).context("PTRACE_SYSCALL failed (syscall-stop)")?;
+            }
+            WaitStatus::Stopped(_, sig) => {
+                // Other signal: pass through
+                ptrace::syscall(child_pid, Some(sig)).context("PTRACE_SYSCALL failed (signal)")?;
+            }
+            WaitStatus::StillAlive => {
+                agg.tick();
+            },
+            _ => {
+                // Continue on other statuses
+                ptrace::syscall(child_pid, None)?;
             }
         }
     }
@@ -307,7 +224,7 @@ fn parent_trace<A: Aggregator>(child_pid: libc::pid_t, agg: &mut A) -> Result<()
     Ok(())
 }
 
-fn decode_syscall_exit(pid: libc::pid_t, regs: &libc::user_regs_struct) -> Option<SyscallEvent> {
+fn decode_syscall_exit(pid: Pid, regs: &libc::user_regs_struct) -> Option<SyscallEvent> {
     let nr = regs.orig_rax as i64;
     let ret = regs.rax as i64;
     let ts = OffsetDateTime::now_utc();
@@ -366,7 +283,6 @@ fn decode_syscall_exit(pid: libc::pid_t, regs: &libc::user_regs_struct) -> Optio
             (SyscallKind::Fsync, Some(fd), 0)
         }
         libc::SYS_mmap => {
-            // On x86_64, fd is 5th arg, in r8
             let fd = regs.r8 as i32;
             (SyscallKind::Mmap, Some(fd), 0)
         }
@@ -374,7 +290,7 @@ fn decode_syscall_exit(pid: libc::pid_t, regs: &libc::user_regs_struct) -> Optio
     };
 
     Some(SyscallEvent {
-        pid,
+        pid: pid.as_raw(),
         ts,
         kind,
         fd,
@@ -382,29 +298,4 @@ fn decode_syscall_exit(pid: libc::pid_t, regs: &libc::user_regs_struct) -> Optio
         resource: None,
         resource_kind: None,
     })
-}
-
-fn spawn_log_reader(fd: libc::c_int, state: Arc<Mutex<LiveState>>, is_stderr: bool) {
-    thread::spawn(move || {
-        // Safety: we own this fd here.
-        let file = unsafe { std::fs::File::from_raw_fd(fd) };
-        let reader = BufReader::new(file);
-
-        for line in reader.lines() {
-            if let Ok(mut line) = line {
-                if is_stderr {
-                    line = format!("[stderr] {}", line);
-                }
-
-                let mut s = state.lock().unwrap();
-                const MAX_LOG_LINES: usize = 200;
-                if s.log_lines.len() >= MAX_LOG_LINES {
-                    s.log_lines.pop_front();
-                }
-                s.log_lines.push_back(line);
-            } else {
-                break;
-            }
-        }
-    });
 }

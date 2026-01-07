@@ -12,6 +12,7 @@ pub trait Aggregator {
     fn on_event(&mut self, event: &SyscallEvent);
     fn on_end(&mut self);
     fn finalize(self) -> Self::Output;
+    fn tick(&mut self) {}
 }
 
 fn is_read_like(kind: SyscallKind) -> bool {

@@ -4,13 +4,16 @@ use std::{
     fmt::{self},
 };
 
+use time::OffsetDateTime;
+
 use crate::model::{
     agg::RunSummary,
+    bin::IoByKind,
     path::PathStats,
     pattern::{HintLevel, PatternHint},
-    phase::{Phase, PhaseKind},
+    phase::{IoCategory, IoPattern, Phase, PhaseKind},
     socket::SocketStats,
-    syscall::{SyscallKind, SyscallStats},
+    syscall::{ResourceKind, SyscallKind, SyscallStats},
 };
 
 pub fn print_summary(summary: &RunSummary) {
@@ -26,14 +29,20 @@ pub fn render_summary_to_string(summary: &RunSummary) -> String {
 }
 
 fn write_summary<W: fmt::Write>(out: &mut W, summary: &RunSummary) -> fmt::Result {
-    let duration = summary.end - summary.start;
+    let duration = summary.end.unwrap_or(OffsetDateTime::now_utc())
+        - summary.start.unwrap_or(OffsetDateTime::now_utc());
     let secs = duration.whole_seconds();
     let nanos = duration.subsec_nanoseconds();
     let frac = (nanos as f64) / 1_000_000_000.0;
     let elapsed = (secs as f64) + frac;
 
-    let rate = if elapsed > 0.0 {
+    let syscall_rate = if elapsed > 0.0 {
         summary.total_syscalls as f64 / elapsed
+    } else {
+        0.0
+    };
+    let bytes_rate = if elapsed > 0.0 {
+        summary.total_bytes as f64 / elapsed
     } else {
         0.0
     };
@@ -41,7 +50,8 @@ fn write_summary<W: fmt::Write>(out: &mut W, summary: &RunSummary) -> fmt::Resul
     writeln!(out, "Command:      {}", summary.cmdline)?;
     writeln!(out, "Duration:     {:.3}s", elapsed)?;
     writeln!(out, "Syscalls:     {}", summary.total_syscalls)?;
-    writeln!(out, "Rate:         {:.1} syscalls/s", rate)?;
+    writeln!(out, "Sys. Rate:    {:.1} syscalls/s", syscall_rate)?;
+    writeln!(out, "Bytes Rate:   {:.1} KB/s", bytes_rate / 1_000.)?;
 
     if !summary.by_kind.is_empty() {
         writeln!(out)?;
@@ -61,6 +71,12 @@ fn write_summary<W: fmt::Write>(out: &mut W, summary: &RunSummary) -> fmt::Resul
         write_network(out, &summary.by_socket)?;
     }
 
+    if !summary.by_resource.is_empty() {
+        writeln!(out)?;
+        writeln!(out, "IO by resource kind:")?;
+        write_resource(out, summary)?;
+    }
+
     if !summary.pattern_hints.is_empty() {
         writeln!(out)?;
         writeln!(out, "Heuristics (patterns):")?;
@@ -76,13 +92,32 @@ fn write_summary<W: fmt::Write>(out: &mut W, summary: &RunSummary) -> fmt::Resul
     Ok(())
 }
 
+fn write_resource<W: fmt::Write>(out: &mut W, summary: &RunSummary) -> Result<(), fmt::Error> {
+    writeln!(out, "{:<10} {:>10} {:>16}", "Resource", "Calls", "Bytes")?;
+    writeln!(out, "{:-<10} {:-<10} {:-<16}", "", "", "")?;
+    let mut rows: Vec<(ResourceKind, &IoByKind)> =
+        summary.by_resource.iter().map(|(k, v)| (*k, v)).collect();
+    rows.sort_by_key(|(_, io)| Reverse(io.bytes));
+    for (res_kind, io) in rows {
+        let name = match res_kind {
+            crate::model::syscall::ResourceKind::File => "file",
+            crate::model::syscall::ResourceKind::Socket => "socket",
+            crate::model::syscall::ResourceKind::Pipe => "pipe",
+            crate::model::syscall::ResourceKind::Tty => "tty",
+        };
+
+        writeln!(out, "{:<10} {:>10} {:>16}", name, io.calls, io.bytes)?;
+    }
+    Ok(())
+}
+
 fn write_syscall_table<W: fmt::Write>(
     out: &mut W,
     map: &HashMap<SyscallKind, SyscallStats>,
 ) -> fmt::Result {
     let mut rows: Vec<(SyscallKind, &SyscallStats)> = map.iter().map(|(k, v)| (*k, v)).collect();
 
-    rows.sort_by_key(|(_, s)| (std::cmp::Reverse(s.total_bytes), Reverse(s.count)));
+    rows.sort_by_key(|(_, s)| (Reverse(s.total_bytes), Reverse(s.count)));
 
     writeln!(out, "{:<10} {:>10} {:>16}", "Kind", "Count", "Bytes")?;
     writeln!(out, "{:-<10} {:-<10} {:-<16}", "", "", "")?;
@@ -120,7 +155,7 @@ fn write_top_paths<W: fmt::Write>(
     max_entries: usize,
 ) -> fmt::Result {
     let mut rows: Vec<(&String, &PathStats)> = map.iter().collect();
-    rows.sort_by_key(|(_, s)| std::cmp::Reverse(s.bytes));
+    rows.sort_by_key(|(_, s)| Reverse(s.bytes));
 
     writeln!(
         out,
@@ -149,24 +184,32 @@ fn write_top_paths<W: fmt::Write>(
 fn write_network<W: fmt::Write>(out: &mut W, map: &HashMap<String, SocketStats>) -> fmt::Result {
     let mut rows: Vec<(&String, &SocketStats)> = map.iter().collect();
 
-    rows.sort_by_key(|(_, s)| std::cmp::Reverse(s.read_bytes + s.write_bytes));
+    rows.sort_by_key(|(_, s)| Reverse(s.read_bytes + s.write_bytes));
 
     writeln!(
         out,
-        "{:<30} {:>12} {:>12} {:>8} {:>8}",
+        "{:<50} {:>12} {:>12} {:>8} {:>8}",
         "Peer", "Read B", "Write B", "R calls", "W calls"
     )?;
     writeln!(
         out,
-        "{:-<30} {:-<12} {:-<12} {:-<8} {:-<8}",
+        "{:-<50} {:-<12} {:-<12} {:-<8} {:-<8}",
         "", "", "", "", ""
     )?;
 
     for (peer, stats) in rows.into_iter().take(10) {
+        let trunc_peer_len = peer.len().min(50);
+        let mut peer = peer.clone();
+        peer.truncate(trunc_peer_len);
+
         writeln!(
             out,
-            "{:<30} {:>12} {:>12} {:>8} {:>8}",
-            peer, stats.read_bytes, stats.write_bytes, stats.read_calls, stats.write_calls
+            "{:<50} {:>12} {:>12} {:>8} {:>8}",
+            peer,
+            stats.read_bytes,
+            stats.write_bytes,
+            stats.read_calls,
+            stats.write_calls
         )?;
     }
 
@@ -187,8 +230,23 @@ fn write_pattern_hints<W: fmt::Write>(out: &mut W, hints: &[PatternHint]) -> fmt
 fn write_phases<W: fmt::Write>(out: &mut W, phases: &[Phase]) -> fmt::Result {
     for p in phases {
         let kind = match p.kind {
-            PhaseKind::IoHeavy => "I/O-heavy",
-            PhaseKind::CpuHeavy => "CPU-ish",
+            PhaseKind::Io { category, pattern } => match category {
+                IoCategory::Disk => match pattern {
+                    IoPattern::Balanced => "Disk IO-heavy (balanced)",
+                    IoPattern::Bursty => "Disk IO-heavy (bursty)",
+                    IoPattern::Streaming => "Disk IO-heavy (streaming)",
+                },
+                IoCategory::Network => match pattern {
+                    IoPattern::Balanced => "Network IO-heavy (balanced)",
+                    IoPattern::Bursty => "Network IO-heavy (bursty)",
+                    IoPattern::Streaming => "Network IO-heavy (streaming)",
+                },
+                IoCategory::Mixed => "Mixed IO-heavy",
+                IoCategory::Pipe => "Pipe IO-heavy",
+                IoCategory::Tty => "TTY IO-heavy",
+            },
+            PhaseKind::Compute => "CPU-heavy",
+            PhaseKind::Idle => "Idle",
         };
         let dur = p.end - p.start;
         let secs = dur.whole_seconds();
@@ -197,8 +255,8 @@ fn write_phases<W: fmt::Write>(out: &mut W, phases: &[Phase]) -> fmt::Result {
 
         writeln!(
             out,
-            "[{}] {:.3}s – syscalls: {}, bytes: {}",
-            kind, elapsed, p.syscalls, p.bytes
+            "[{}] {:.3}s – syscalls: {}, bytes: {}, avg bytes per call: {:.1}",
+            kind, elapsed, p.syscalls, p.bytes, p.avg_bytes_per_call
         )?;
     }
     Ok(())

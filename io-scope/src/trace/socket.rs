@@ -3,13 +3,15 @@ use std::{
     io::{BufRead, BufReader},
 };
 
+use nix::unistd::Pid;
+
 use crate::model::syscall::ResourceKind;
 
 #[derive(Debug, Clone)]
 pub struct SocketEndpoint {
-    proto: String,  // "tcp" or "udp"
-    local: String,  // "ip:port"
-    remote: String, // "ip:port"
+    proto: String,
+    local: String,
+    remote: String,
 }
 
 pub type SocketTable = HashMap<u64, SocketEndpoint>;
@@ -27,11 +29,11 @@ fn classify_fd_path(path: &str) -> ResourceKind {
 }
 
 pub fn resolve_fd_info(
-    pid: libc::pid_t,
+    pid: Pid,
     fd: i32,
     socket_table: &mut SocketTable,
 ) -> Option<(String, ResourceKind)> {
-    let path_str = format!("/proc/{}/fd/{}", pid, fd);
+    let path_str = format!("/proc/{}/fd/{}", pid.as_raw(), fd);
     let link = std::fs::read_link(&path_str).ok()?;
     let target = link.to_string_lossy().to_string();
 
@@ -40,7 +42,6 @@ pub fn resolve_fd_info(
     if kind == ResourceKind::Socket
         && let Some(peer) = map_socket_to_peer(&target, socket_table)
     {
-        // peer already includes proto
         return Some((peer, ResourceKind::Socket));
     }
 
@@ -48,14 +49,12 @@ pub fn resolve_fd_info(
 }
 
 fn map_socket_to_peer(target: &str, socket_table: &mut SocketTable) -> Option<String> {
-    // target is like "socket:[12345]"
     let inode = extract_socket_inode(target)?;
     if socket_table.is_empty() {
         *socket_table = load_socket_table();
     }
     if let Some(ep) = socket_table.get(&inode) {
-        // We aggregate by remote endpoint; include proto.
-        return Some(format!("{} {}", ep.proto, ep.remote));
+        return Some(format!("{} {} <~> {}", ep.proto, ep.local, ep.remote));
     }
     None
 }
@@ -65,6 +64,7 @@ fn extract_socket_inode(target: &str) -> Option<u64> {
     let end = target.find(']')?;
     target[start..end].parse::<u64>().ok()
 }
+
 fn load_socket_table() -> SocketTable {
     let mut table = SocketTable::new();
     load_proc_net("tcp", &mut table);
@@ -81,13 +81,9 @@ fn load_proc_net(proto: &str, table: &mut SocketTable) {
     let reader = BufReader::new(f);
 
     for (i, line) in reader.lines().enumerate() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => continue,
-        };
+        let Ok(line) = line else { continue };
         if i == 0 {
-            // header
-            continue;
+            continue; // header
         }
         if let Some((local, remote, inode)) = parse_proc_net_line(&line) {
             let ep = SocketEndpoint {
@@ -100,10 +96,7 @@ fn load_proc_net(proto: &str, table: &mut SocketTable) {
     }
 }
 
-// Very minimal parser for /proc/net/{tcp,udp} IPv4 lines.
 fn parse_proc_net_line(line: &str) -> Option<(String, String, u64)> {
-    // Fields are space-separated; we care about:
-    // local_address (1), rem_address (2), inode (9) in typical layouts.
     let parts: Vec<&str> = line.split_whitespace().collect();
     if parts.len() < 10 {
         return None;
@@ -120,7 +113,6 @@ fn parse_proc_net_line(line: &str) -> Option<(String, String, u64)> {
 }
 
 fn hex_ip_port_to_string(s: &str) -> Option<String> {
-    // s like "0100007F:0035" (IP in little-endian hex, port hex)
     let mut parts = s.split(':');
     let ip_hex = parts.next()?;
     let port_hex = parts.next()?;
