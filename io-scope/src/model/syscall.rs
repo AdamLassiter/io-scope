@@ -42,3 +42,10 @@ pub struct SyscallStats {
     pub count: u64,
     pub total_bytes: u64,
 }
+
+/// Stats broken down by resource kind (disk, network, etc.)
+#[derive(Debug, Clone, Default)]
+pub struct KindStats {
+    pub calls: u64,
+    pub bytes: u64,
+}

@@ -27,7 +27,7 @@ impl SummaryAggregator {
         Self {
             start: None,
             end: None,
-            bucket: Duration::milliseconds(200),
+            bucket: Duration::milliseconds(100),
             bins: Vec::new(),
         }
     }
@@ -142,6 +142,7 @@ impl SummaryAggregator {
             by_path: totals.by_path,
             by_socket: totals.by_socket,
             by_resource: totals.by_resource,
+            by_pid: totals.by_pid,
             pattern_hints,
             phases,
         }

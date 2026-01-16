@@ -1,7 +1,7 @@
 use crate::model::{
-    bin::{AggregatedTotals, IoByKind},
+    bin::AggregatedTotals,
     pattern::{HintLevel, PatternHint},
-    syscall::{ResourceKind, SyscallKind},
+    syscall::{KindStats, ResourceKind, SyscallKind},
 };
 
 pub fn build_pattern_hints(totals: &AggregatedTotals) -> Vec<PatternHint> {
@@ -76,7 +76,7 @@ fn add_io_size_hints(hints: &mut Vec<PatternHint>, totals: &AggregatedTotals) {
 
 fn add_resource_hints(
     hints: &mut Vec<PatternHint>,
-    by_resource: &std::collections::HashMap<ResourceKind, IoByKind>,
+    by_resource: &std::collections::HashMap<ResourceKind, KindStats>,
 ) {
     // Check for high network IO with small packets
     if let Some(net_io) = by_resource.get(&ResourceKind::Socket)

@@ -24,7 +24,7 @@ impl LiveAggregator {
             state,
             last_sample_time: None,
             last_sample_syscalls: 0,
-            sample_interval: Duration::milliseconds(500),
+            sample_interval: Duration::milliseconds(100),
             max_samples: 40,
             is_running: false,
         }

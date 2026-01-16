@@ -1,9 +1,14 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use time::OffsetDateTime;
 
 use crate::model::{
-    bin::{IoByKind, TimeBin}, path::PathStats, pattern::PatternHint, phase::Phase, socket::SocketStats, syscall::{ResourceKind, SyscallKind, SyscallStats}
+    bin::TimeBin,
+    path::PathStats,
+    pattern::PatternHint,
+    phase::Phase,
+    socket::SocketStats,
+    syscall::{KindStats, ResourceKind, SyscallKind, SyscallStats},
 };
 
 #[derive(Debug, Clone)]
@@ -20,7 +25,8 @@ pub struct RunSummary {
     pub by_kind: HashMap<SyscallKind, SyscallStats>,
     pub by_path: HashMap<String, PathStats>,
     pub by_socket: HashMap<String, SocketStats>,
-    pub by_resource: HashMap<ResourceKind, IoByKind>,
+    pub by_resource: HashMap<ResourceKind, KindStats>,
+    pub by_pid: HashMap<i32, RunSummary>,
 
     // Heuristic analysis results
     pub pattern_hints: Vec<PatternHint>,
@@ -39,4 +45,6 @@ pub struct LiveState {
 
     /// Captured stdout/stderr lines from the traced process.
     pub log_lines: VecDeque<String>,
+
+    pub child_pids: HashSet<i32>,
 }

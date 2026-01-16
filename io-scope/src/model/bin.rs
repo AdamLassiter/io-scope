@@ -1,17 +1,8 @@
 use std::collections::HashMap;
 
 use crate::model::{
-    path::PathStats,
-    socket::SocketStats,
-    syscall::{ResourceKind, SyscallKind, SyscallStats},
+    agg::RunSummary, path::PathStats, socket::SocketStats, syscall::{KindStats, ResourceKind, SyscallKind, SyscallStats}
 };
-
-/// Stats broken down by resource kind (disk, network, etc.)
-#[derive(Debug, Clone, Default)]
-pub struct IoByKind {
-    pub calls: u64,
-    pub bytes: u64,
-}
 
 /// A single time bucket capturing all stats for that interval.
 #[derive(Debug, Clone, Default)]
@@ -21,7 +12,8 @@ pub struct TimeBin {
     pub by_kind: HashMap<SyscallKind, SyscallStats>,
     pub by_path: HashMap<String, PathStats>,
     pub by_socket: HashMap<String, SocketStats>,
-    pub by_resource: HashMap<ResourceKind, IoByKind>,
+    pub by_resource: HashMap<ResourceKind, KindStats>,
+    pub by_pid: HashMap<i32, RunSummary>,
 }
 
 impl TimeBin {
@@ -77,7 +69,8 @@ pub struct AggregatedTotals {
     pub by_kind: HashMap<SyscallKind, SyscallStats>,
     pub by_path: HashMap<String, PathStats>,
     pub by_socket: HashMap<String, SocketStats>,
-    pub by_resource: HashMap<ResourceKind, IoByKind>,
+    pub by_resource: HashMap<ResourceKind, KindStats>,
+    pub by_pid: HashMap<i32, RunSummary>,
 }
 
 impl AggregatedTotals {
@@ -93,6 +86,7 @@ impl AggregatedTotals {
             by_path: result.by_path,
             by_socket: result.by_socket,
             by_resource: result.by_resource,
+            by_pid: result.by_pid,
         }
     }
 }

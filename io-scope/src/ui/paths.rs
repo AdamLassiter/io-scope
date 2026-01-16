@@ -9,7 +9,7 @@ use ratatui::{
 
 use crate::model::{agg::LiveState, path::PathStats};
 
-pub fn draw_paths(frame: &mut Frame, area: Rect, state: &LiveState) {
+pub fn draw_paths(frame: &mut Frame, area: Rect, state: &LiveState, scroll: u16) {
     let block = Block::default()
         .title("Top paths by bytes")
         .borders(Borders::ALL);
@@ -45,7 +45,7 @@ pub fn draw_paths(frame: &mut Frame, area: Rect, state: &LiveState) {
         )));
     }
 
-    let paragraph = Paragraph::new(lines).block(block);
+    let paragraph = Paragraph::new(lines).block(block).scroll((scroll, 0));
     frame.render_widget(paragraph, area);
 }
 

@@ -8,12 +8,11 @@ use time::OffsetDateTime;
 
 use crate::model::{
     agg::RunSummary,
-    bin::IoByKind,
     path::PathStats,
     pattern::{HintLevel, PatternHint},
     phase::{IoCategory, IoPattern, Phase, PhaseKind},
     socket::SocketStats,
-    syscall::{ResourceKind, SyscallKind, SyscallStats},
+    syscall::{KindStats, ResourceKind, SyscallKind, SyscallStats},
 };
 
 pub fn print_summary(summary: &RunSummary) {
@@ -51,7 +50,7 @@ fn write_summary<W: fmt::Write>(out: &mut W, summary: &RunSummary) -> fmt::Resul
     writeln!(out, "Duration:     {:.3}s", elapsed)?;
     writeln!(out, "Syscalls:     {}", summary.total_syscalls)?;
     writeln!(out, "Sys. Rate:    {:.1} syscalls/s", syscall_rate)?;
-    writeln!(out, "Bytes Rate:   {:.1} KB/s", bytes_rate / 1_000.)?;
+    writeln!(out, "Bytes Rate:   {:.1} bytes/s", bytes_rate)?;
 
     if !summary.by_kind.is_empty() {
         writeln!(out)?;
@@ -95,7 +94,7 @@ fn write_summary<W: fmt::Write>(out: &mut W, summary: &RunSummary) -> fmt::Resul
 fn write_resource<W: fmt::Write>(out: &mut W, summary: &RunSummary) -> Result<(), fmt::Error> {
     writeln!(out, "{:<10} {:>10} {:>16}", "Resource", "Calls", "Bytes")?;
     writeln!(out, "{:-<10} {:-<10} {:-<16}", "", "", "")?;
-    let mut rows: Vec<(ResourceKind, &IoByKind)> =
+    let mut rows: Vec<(ResourceKind, &KindStats)> =
         summary.by_resource.iter().map(|(k, v)| (*k, v)).collect();
     rows.sort_by_key(|(_, io)| Reverse(io.bytes));
     for (res_kind, io) in rows {
@@ -205,11 +204,7 @@ fn write_network<W: fmt::Write>(out: &mut W, map: &HashMap<String, SocketStats>)
         writeln!(
             out,
             "{:<50} {:>12} {:>12} {:>8} {:>8}",
-            peer,
-            stats.read_bytes,
-            stats.write_bytes,
-            stats.read_calls,
-            stats.write_calls
+            peer, stats.read_bytes, stats.write_bytes, stats.read_calls, stats.write_calls
         )?;
     }
 

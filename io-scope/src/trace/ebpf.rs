@@ -1,14 +1,14 @@
 use std::{
     ffi::CString,
     os::fd::OwnedFd,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex}, time::Duration,
 };
 
 use anyhow::{Context, Result, anyhow};
 use aya::{
     Ebpf,
     EbpfLoader,
-    maps::{Array, perf::PerfEventArray},
+    maps::{Array, MapData, perf::{PerfEventArray, PerfEventArrayBuffer}},
     programs::TracePoint,
     util::online_cpus,
 };
@@ -129,6 +129,12 @@ fn run_linux_ebpf<A: Aggregator>(
 
     agg.on_start();
 
+    // Track the initial child PID
+    if let Some(ref state) = live_state {
+        let mut s = state.lock().unwrap();
+        s.child_pids.clear();
+    }
+
     // Set up pipes if in live mode
     let use_pipes = matches!(cfg.mode, RunMode::Live) && live_state.is_some();
     let stdout_pipe = if use_pipes {
@@ -142,77 +148,16 @@ fn run_linux_ebpf<A: Aggregator>(
         None
     };
 
-    // 1) Spawn stopped child process
-    let child_pid = match unsafe { fork() }.context("fork failed")? {
-        ForkResult::Child => {
-            child_exec(cfg, use_pipes, stdout_pipe, stderr_pipe);
-        }
-        ForkResult::Parent { child } => child,
-    };
-
-    // Parent: close write ends, spawn log readers
-    if use_pipes {
-        if let Some((read_fd, write_fd)) = stdout_pipe {
-            close(write_fd)?;
-            if let Some(state) = live_state.as_ref() {
-                spawn_log_reader(read_fd, state.clone(), false);
-            }
-        }
-        if let Some((read_fd, write_fd)) = stderr_pipe {
-            close(write_fd)?;
-            if let Some(state) = live_state.as_ref() {
-                spawn_log_reader(read_fd, state.clone(), true);
-            }
-        }
-    }
-
-    // 2) Configure BPF
-    {
-        let map = bpf
-            .map_mut("TARGET_TGID")
-            .ok_or_else(|| anyhow!("BPF map TARGET_TGID not found"))?;
-        let mut arr: Array<_, u32> = Array::try_from(map)?;
-        arr.set(0, child_pid.as_raw() as u32, 0)
-            .context("failed to set TARGET_TGID")?;
-    }
-
-    // Attach tracepoints
-    for (name, category, tp_name) in [
-        ("sys_enter_read", "syscalls", "sys_enter_read"),
-        ("sys_enter_write", "syscalls", "sys_enter_write"),
-        ("sys_exit_read", "syscalls", "sys_exit_read"),
-        ("sys_exit_write", "syscalls", "sys_exit_write"),
-    ] {
-        let prog = bpf
-            .program_mut(name)
-            .ok_or_else(|| anyhow!("BPF program {} not found", name))?;
-        let prog: &mut TracePoint = prog.try_into()?;
-        prog.load()?;
-        prog.attach(category, tp_name)
-            .with_context(|| format!("attach {}", name))?;
-    }
-
-    // Set up perf buffers for all CPUs
-    let io_map = bpf
-        .map_mut("IO_EVENTS")
-        .ok_or_else(|| anyhow!("BPF map IO_EVENTS not found"))?;
-    let mut perf = PerfEventArray::try_from(io_map)?;
-
-    let cpus = online_cpus()
-        .map_err(|(_msg, err)| err)
-        .context("failed to get online CPUs")?;
-    let mut bufs: Vec<_> = cpus
-        .iter()
-        .map(|cpu| perf.open(*cpu, None))
-        .collect::<Result<_, _>>()
-        .context("failed to open perf buffers")?;
-
-    let mut slots: Vec<BytesMut> = (0..8).map(|_| BytesMut::with_capacity(4096)).collect();
-
-    // 3) Resume child
+    let child_pid = spawn_stopped_child(cfg, &live_state, use_pipes, stdout_pipe, stderr_pipe)?;
+    let (bufs, slots) = configure_ebpf(&mut bpf, child_pid)?;
     kill(child_pid, Signal::SIGCONT).context("failed to resume child")?;
+    poll_ringbuffers(agg, live_state, child_pid, bufs, slots)?;
 
-    // 4) Poll perf buffers
+    agg.on_end();
+    Ok(())
+}
+
+fn poll_ringbuffers<A: Aggregator>(agg: &mut A, live_state: Option<Arc<Mutex<LiveState>>>, child_pid: Pid, mut bufs: Vec<PerfEventArrayBuffer<&mut MapData>>, mut slots: Vec<BytesMut>) -> Result<(), anyhow::Error> {
     let mut child_done = false;
     loop {
         let mut got_events = false;
@@ -227,6 +172,13 @@ fn run_linux_ebpf<A: Aggregator>(
                 if slot.len() >= std::mem::size_of::<IoEvent>() {
                     let io_ev: IoEvent =
                         unsafe { std::ptr::read_unaligned(slot.as_ptr() as *const _) };
+
+                    // Track any new child PIDs we see
+                    if let Some(ref state) = live_state {
+                        let mut s = state.lock().unwrap();
+                        s.child_pids.insert(io_ev.pid);
+                    }
+
                     let ev = io_event_to_syscall_event(&io_ev);
                     agg.on_event(&ev);
                 }
@@ -246,12 +198,77 @@ fn run_linux_ebpf<A: Aggregator>(
         }
 
         if !got_events {
-            std::thread::sleep(std::time::Duration::from_micros(100));
+            std::thread::sleep(Duration::from_micros(10));
+        }
+    };
+    Ok(())
+}
+
+fn configure_ebpf(bpf: &mut Ebpf, child_pid: Pid) -> Result<(Vec<PerfEventArrayBuffer<&mut MapData>>, Vec<BytesMut>), anyhow::Error> {
+    {
+        let map = bpf
+            .map_mut("TARGET_TGID")
+            .ok_or_else(|| anyhow!("BPF map TARGET_TGID not found"))?;
+        let mut arr: Array<_, u32> = Array::try_from(map)?;
+        arr.set(0, child_pid.as_raw() as u32, 0)
+            .context("failed to set TARGET_TGID")?;
+    }
+    for (name, category, tp_name) in [
+        ("sys_enter_read", "syscalls", "sys_enter_read"),
+        ("sys_enter_write", "syscalls", "sys_enter_write"),
+        ("sys_exit_read", "syscalls", "sys_exit_read"),
+        ("sys_exit_write", "syscalls", "sys_exit_write"),
+    ] {
+        let prog = bpf
+            .program_mut(name)
+            .ok_or_else(|| anyhow!("BPF program {} not found", name))?;
+        let prog: &mut TracePoint = prog.try_into()?;
+        prog.load()?;
+        prog.attach(category, tp_name)
+            .with_context(|| format!("attach {}", name))?;
+    }
+    let io_map = bpf
+        .map_mut("IO_EVENTS")
+        .ok_or_else(|| anyhow!("BPF map IO_EVENTS not found"))?;
+    let mut perf = PerfEventArray::try_from(io_map)?;
+    let cpus = online_cpus()
+        .map_err(|(_msg, err)| err)
+        .context("failed to get online CPUs")?;
+    let bufs: Vec<_> = cpus
+        .iter()
+        .map(|cpu| perf.open(*cpu, None))
+        .collect::<Result<_, _>>()
+        .context("failed to open perf buffers")?;
+    let slots: Vec<BytesMut> = (0..8).map(|_| BytesMut::with_capacity(4096)).collect();
+    Ok((bufs, slots))
+}
+
+fn spawn_stopped_child(cfg: &RunConfig, live_state: &Option<Arc<Mutex<LiveState>>>, use_pipes: bool, stdout_pipe: Option<(OwnedFd, OwnedFd)>, stderr_pipe: Option<(OwnedFd, OwnedFd)>) -> Result<Pid, anyhow::Error> {
+    let child_pid = match unsafe { fork() }.context("fork failed")? {
+        ForkResult::Child => {
+            child_exec(cfg, use_pipes, stdout_pipe, stderr_pipe);
+        }
+        ForkResult::Parent { child } => child,
+    };
+    if use_pipes {
+        if let Some((read_fd, write_fd)) = stdout_pipe {
+            close(write_fd)?;
+            if let Some(state) = live_state.as_ref() {
+                spawn_log_reader(read_fd, state.clone(), false);
+            }
+        }
+        if let Some((read_fd, write_fd)) = stderr_pipe {
+            close(write_fd)?;
+            if let Some(state) = live_state.as_ref() {
+                spawn_log_reader(read_fd, state.clone(), true);
+            }
         }
     }
-
-    agg.on_end();
-    Ok(())
+    if let Some(ref state) = *live_state {
+        let mut s = state.lock().unwrap();
+        s.child_pids.insert(child_pid.as_raw());
+    }
+    Ok(child_pid)
 }
 
 fn io_event_to_syscall_event(io_ev: &IoEvent) -> SyscallEvent {
