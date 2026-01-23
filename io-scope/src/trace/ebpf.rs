@@ -1,18 +1,19 @@
 use std::{
+    env::var,
     ffi::CString,
+    fs::read,
     os::fd::OwnedFd,
-    sync::{Arc, Mutex}, time::Duration,
+    sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use anyhow::{Context, Result, anyhow};
 use aya::{
     Ebpf,
     EbpfLoader,
-    maps::{Array, MapData, perf::{PerfEventArray, PerfEventArrayBuffer}},
+    maps::{Array, MapData, RingBuf},
     programs::TracePoint,
-    util::online_cpus,
 };
-use bytes::BytesMut;
 use nix::{
     sys::{
         signal::{Signal, kill, raise},
@@ -36,6 +37,89 @@ use crate::{
     },
 };
 
+// Match SyscallKind enum from eBPF kernelspace
+const KIND_READ: u8 = 0;
+const KIND_WRITE: u8 = 1;
+const KIND_PREAD: u8 = 2;
+const KIND_PWRITE: u8 = 3;
+const KIND_READV: u8 = 4;
+const KIND_WRITEV: u8 = 5;
+const KIND_SEND: u8 = 6;
+const KIND_RECV: u8 = 7;
+const KIND_OPEN: u8 = 8;
+const KIND_CLOSE: u8 = 9;
+const KIND_FSYNC: u8 = 10;
+const KIND_MMAP: u8 = 11;
+
+const TRACEPOINTS: &[&str] = &[
+    // read/write
+    "sys_enter_read",
+    "sys_exit_read",
+    "sys_enter_write",
+    "sys_exit_write",
+    // pread64/pwrite64
+    "sys_enter_pread64",
+    "sys_exit_pread64",
+    "sys_enter_pwrite64",
+    "sys_exit_pwrite64",
+    // readv/writev
+    "sys_enter_readv",
+    "sys_exit_readv",
+    "sys_enter_writev",
+    "sys_exit_writev",
+    // preadv/pwritev
+    "sys_enter_preadv",
+    "sys_exit_preadv",
+    "sys_enter_pwritev",
+    "sys_exit_pwritev",
+    // preadv2/pwritev2
+    "sys_enter_preadv2",
+    "sys_exit_preadv2",
+    "sys_enter_pwritev2",
+    "sys_exit_pwritev2",
+    // sendto/recvfrom
+    "sys_enter_sendto",
+    "sys_exit_sendto",
+    "sys_enter_recvfrom",
+    "sys_exit_recvfrom",
+    // sendmsg/recvmsg
+    "sys_enter_sendmsg",
+    "sys_exit_sendmsg",
+    "sys_enter_recvmsg",
+    "sys_exit_recvmsg",
+    // sendmmsg/recvmmsg
+    "sys_enter_sendmmsg",
+    "sys_exit_sendmmsg",
+    "sys_enter_recvmmsg",
+    "sys_exit_recvmmsg",
+    // sendfile64
+    "sys_enter_sendfile64",
+    "sys_exit_sendfile64",
+    // open/openat/openat2
+    "sys_enter_open",
+    "sys_exit_open",
+    "sys_enter_openat",
+    "sys_exit_openat",
+    "sys_enter_openat2",
+    "sys_exit_openat2",
+    // close
+    "sys_enter_close",
+    "sys_exit_close",
+    // fsync/fdatasync
+    "sys_enter_fsync",
+    "sys_exit_fsync",
+    "sys_enter_fdatasync",
+    "sys_exit_fdatasync",
+    // mmap
+    "sys_enter_mmap",
+    "sys_exit_mmap",
+    // splice/copy_file_range
+    "sys_enter_splice",
+    "sys_exit_splice",
+    "sys_enter_copy_file_range",
+    "sys_exit_copy_file_range",
+];
+
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
 pub struct IoEvent {
@@ -52,9 +136,9 @@ pub struct EbpfTracer {
 
 impl EbpfTracer {
     pub fn new() -> Result<Self> {
-        let path = std::env::var("IO_SCOPE_EBPF_PATH")
+        let path = var("IO_SCOPE_EBPF_PATH")
             .context("IO_SCOPE_EBPF_PATH not set; did you build your eBPF object?")?;
-        let data = std::fs::read(path).context("failed to read BPF object")?;
+        let data = read(path).context("failed to read BPF object")?;
 
         let bpf = EbpfLoader::new().load(&data)?;
         Ok(Self { bpf: Some(bpf) })
@@ -149,62 +233,21 @@ fn run_linux_ebpf<A: Aggregator>(
     };
 
     let child_pid = spawn_stopped_child(cfg, &live_state, use_pipes, stdout_pipe, stderr_pipe)?;
-    let (bufs, slots) = configure_ebpf(&mut bpf, child_pid)?;
+    let (ring, drop_count) = configure_ebpf(&mut bpf, child_pid)?;
+
+    let drop_count = move || -> Result<u64> { Ok(drop_count.get(&0, 0)?) };
+
     kill(child_pid, Signal::SIGCONT).context("failed to resume child")?;
-    poll_ringbuffers(agg, live_state, child_pid, bufs, slots)?;
+    poll_ringbuf(agg, live_state, child_pid, ring, drop_count)?;
 
     agg.on_end();
     Ok(())
 }
 
-fn poll_ringbuffers<A: Aggregator>(agg: &mut A, live_state: Option<Arc<Mutex<LiveState>>>, child_pid: Pid, mut bufs: Vec<PerfEventArrayBuffer<&mut MapData>>, mut slots: Vec<BytesMut>) -> Result<(), anyhow::Error> {
-    let mut child_done = false;
-    loop {
-        let mut got_events = false;
-
-        for buf in &mut bufs {
-            let events = buf.read_events(&mut slots)?;
-            if events.read > 0 {
-                got_events = true;
-            }
-
-            for slot in slots.iter().take(events.read) {
-                if slot.len() >= std::mem::size_of::<IoEvent>() {
-                    let io_ev: IoEvent =
-                        unsafe { std::ptr::read_unaligned(slot.as_ptr() as *const _) };
-
-                    // Track any new child PIDs we see
-                    if let Some(ref state) = live_state {
-                        let mut s = state.lock().unwrap();
-                        s.child_pids.insert(io_ev.pid);
-                    }
-
-                    let ev = io_event_to_syscall_event(&io_ev);
-                    agg.on_event(&ev);
-                }
-            }
-        }
-
-        if child_done && !got_events {
-            let any_readable = bufs.iter().any(|buf| buf.readable());
-            if !any_readable {
-                break;
-            }
-        }
-
-        if !child_done {
-            child_done = check_child_done(child_pid)?;
-            agg.tick();
-        }
-
-        if !got_events {
-            std::thread::sleep(Duration::from_micros(10));
-        }
-    };
-    Ok(())
-}
-
-fn configure_ebpf(bpf: &mut Ebpf, child_pid: Pid) -> Result<(Vec<PerfEventArrayBuffer<&mut MapData>>, Vec<BytesMut>), anyhow::Error> {
+fn configure_ebpf(
+    bpf: &mut Ebpf,
+    child_pid: Pid,
+) -> Result<(RingBuf<&MapData>, Array<&MapData, u64>), anyhow::Error> {
     {
         let map = bpf
             .map_mut("TARGET_TGID")
@@ -213,37 +256,92 @@ fn configure_ebpf(bpf: &mut Ebpf, child_pid: Pid) -> Result<(Vec<PerfEventArrayB
         arr.set(0, child_pid.as_raw() as u32, 0)
             .context("failed to set TARGET_TGID")?;
     }
-    for (name, category, tp_name) in [
-        ("sys_enter_read", "syscalls", "sys_enter_read"),
-        ("sys_enter_write", "syscalls", "sys_enter_write"),
-        ("sys_exit_read", "syscalls", "sys_exit_read"),
-        ("sys_exit_write", "syscalls", "sys_exit_write"),
-    ] {
+
+    for name in TRACEPOINTS {
         let prog = bpf
             .program_mut(name)
             .ok_or_else(|| anyhow!("BPF program {} not found", name))?;
         let prog: &mut TracePoint = prog.try_into()?;
         prog.load()?;
-        prog.attach(category, tp_name)
+        prog.attach("syscalls", name)
             .with_context(|| format!("attach {}", name))?;
     }
+
     let io_map = bpf
-        .map_mut("IO_EVENTS")
+        .map("IO_EVENTS")
         .ok_or_else(|| anyhow!("BPF map IO_EVENTS not found"))?;
-    let mut perf = PerfEventArray::try_from(io_map)?;
-    let cpus = online_cpus()
-        .map_err(|(_msg, err)| err)
-        .context("failed to get online CPUs")?;
-    let bufs: Vec<_> = cpus
-        .iter()
-        .map(|cpu| perf.open(*cpu, None))
-        .collect::<Result<_, _>>()
-        .context("failed to open perf buffers")?;
-    let slots: Vec<BytesMut> = (0..8).map(|_| BytesMut::with_capacity(4096)).collect();
-    Ok((bufs, slots))
+    let ring = RingBuf::try_from(io_map)?;
+
+    let drop_map = bpf
+        .map("DROP_COUNT")
+        .ok_or_else(|| anyhow!("BPF map DROP_COUNT not found"))?;
+    let drop_count: Array<_, u64> = Array::try_from(drop_map)?;
+
+    Ok((ring, drop_count))
 }
 
-fn spawn_stopped_child(cfg: &RunConfig, live_state: &Option<Arc<Mutex<LiveState>>>, use_pipes: bool, stdout_pipe: Option<(OwnedFd, OwnedFd)>, stderr_pipe: Option<(OwnedFd, OwnedFd)>) -> Result<Pid, anyhow::Error> {
+fn poll_ringbuf<A: Aggregator, T>(
+    agg: &mut A,
+    live_state: Option<Arc<Mutex<LiveState>>>,
+    child_pid: Pid,
+    mut ring: RingBuf<&MapData>,
+    dropped_events: T,
+) -> Result<(), anyhow::Error>
+where
+    T: Fn() -> Result<u64, anyhow::Error>,
+{
+    let mut child_done = false;
+    let mut last_dropped = 0;
+
+    loop {
+        let mut got_events = false;
+
+        while let Some(item) = ring.next() {
+            got_events = true;
+
+            if item.len() >= std::mem::size_of::<IoEvent>() {
+                let io_ev: IoEvent = unsafe { std::ptr::read_unaligned(item.as_ptr() as *const _) };
+
+                let current_drops = dropped_events()?;
+                if current_drops != last_dropped {
+                    agg.on_dropped(current_drops - last_dropped);
+                    last_dropped = current_drops;
+                }
+
+                if let Some(ref state) = live_state {
+                    let mut s = state.lock().unwrap();
+                    s.child_pids.insert(io_ev.pid);
+                }
+
+                let ev = io_event_to_syscall_event(&io_ev);
+                agg.on_event(&ev);
+            }
+        }
+
+        if child_done && !got_events {
+            break;
+        }
+
+        if !child_done {
+            child_done = check_child_done(child_pid)?;
+            agg.tick();
+        }
+
+        if !got_events {
+            std::thread::sleep(Duration::from_micros(100));
+        }
+    }
+
+    Ok(())
+}
+
+fn spawn_stopped_child(
+    cfg: &RunConfig,
+    live_state: &Option<Arc<Mutex<LiveState>>>,
+    use_pipes: bool,
+    stdout_pipe: Option<(OwnedFd, OwnedFd)>,
+    stderr_pipe: Option<(OwnedFd, OwnedFd)>,
+) -> Result<Pid, anyhow::Error> {
     let child_pid = match unsafe { fork() }.context("fork failed")? {
         ForkResult::Child => {
             child_exec(cfg, use_pipes, stdout_pipe, stderr_pipe);
@@ -272,10 +370,20 @@ fn spawn_stopped_child(cfg: &RunConfig, live_state: &Option<Arc<Mutex<LiveState>
 }
 
 fn io_event_to_syscall_event(io_ev: &IoEvent) -> SyscallEvent {
-    let kind = if io_ev.kind == 0 {
-        SyscallKind::Read
-    } else {
-        SyscallKind::Write
+    let kind = match io_ev.kind {
+        KIND_READ => SyscallKind::Read,
+        KIND_WRITE => SyscallKind::Write,
+        KIND_PREAD => SyscallKind::Pread,
+        KIND_PWRITE => SyscallKind::Pwrite,
+        KIND_READV => SyscallKind::Readv,
+        KIND_WRITEV => SyscallKind::Writev,
+        KIND_SEND => SyscallKind::Send,
+        KIND_RECV => SyscallKind::Recv,
+        KIND_OPEN => SyscallKind::Open,
+        KIND_CLOSE => SyscallKind::Close,
+        KIND_FSYNC => SyscallKind::Fsync,
+        KIND_MMAP => SyscallKind::Mmap,
+        _ => SyscallKind::Other,
     };
 
     let bytes = if io_ev.bytes > 0 {

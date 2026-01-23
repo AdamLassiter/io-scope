@@ -15,6 +15,7 @@ use crate::model::{
 pub struct RunSummary {
     pub cmdline: String,
     pub total_syscalls: u64,
+    pub total_dropped: u64,
     pub total_bytes: u64,
     pub start: Option<OffsetDateTime>,
     pub end: Option<OffsetDateTime>,

@@ -11,7 +11,7 @@ mod splice_tee;
 
 use aya_ebpf::{
     macros::map,
-    maps::{Array, HashMap, PerfEventArray},
+    maps::{Array, HashMap, RingBuf},
 };
 
 #[repr(C)]
@@ -38,7 +38,7 @@ const KIND_FSYNC: u8 = 10;
 const KIND_MMAP: u8 = 11;
 
 #[map(name = "IO_EVENTS")]
-static mut IO_EVENTS: PerfEventArray<IoEvent> = PerfEventArray::new(0);
+static mut IO_EVENTS: RingBuf = RingBuf::with_byte_size(4 * 1024 * 1024, 0); // 4MB buffer
 
 #[map(name = "TARGET_TGID")]
 static mut TARGET_TGID: Array<u32> = Array::with_max_entries(1, 0);
@@ -46,6 +46,9 @@ static mut TARGET_TGID: Array<u32> = Array::with_max_entries(1, 0);
 // Store fd from sys_enter to use in sys_exit
 #[map(name = "FD_BY_PID")]
 static mut FD_BY_PID: HashMap<u64, i32> = HashMap::with_max_entries(10240, 0);
+
+#[map(name = "DROP_COUNT")]
+static mut DROP_COUNT: Array<u64> = Array::with_max_entries(1, 0);
 
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {

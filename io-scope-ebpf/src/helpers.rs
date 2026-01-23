@@ -1,9 +1,6 @@
-use aya_ebpf::{
-    helpers::bpf_get_current_pid_tgid,
-    programs::TracePointContext,
-};
+use aya_ebpf::{helpers::bpf_get_current_pid_tgid, programs::TracePointContext};
 
-use crate::{FD_BY_PID, IO_EVENTS, IoEvent, KIND_MMAP, KIND_OPEN, TARGET_TGID};
+use crate::{DROP_COUNT, FD_BY_PID, IO_EVENTS, IoEvent, KIND_MMAP, KIND_OPEN, TARGET_TGID};
 
 // ----------------------------------------------------------------------------
 // Shared handler implementations
@@ -49,6 +46,20 @@ pub fn handle_sys_enter_no_fd(ctx: &TracePointContext) -> Result<u32, i64> {
 }
 
 /// Handle sys_exit for read/write syscalls (return value is bytes)
+fn emit_event(ev: IoEvent) {
+    unsafe {
+        if let Some(mut entry) = IO_EVENTS.reserve::<IoEvent>(0) {
+            entry.write(ev);
+            entry.submit(0);
+        } else {
+            // Ring buffer full - increment drop counter
+            if let Some(count) = DROP_COUNT.get_ptr_mut(0) {
+                *count += 1;
+            }
+        }
+    }
+}
+
 pub fn handle_sys_exit_rw(ctx: &TracePointContext, kind: u8) -> Result<u32, i64> {
     let ret = unsafe { ctx.read_at::<i64>(16)? };
 
@@ -77,17 +88,13 @@ pub fn handle_sys_exit_rw(ctx: &TracePointContext, kind: u8) -> Result<u32, i64>
         return Ok(0);
     }
 
-    let ev = IoEvent {
+    emit_event(IoEvent {
         tgid,
         pid,
         fd,
         bytes: ret,
         kind,
-    };
-
-    unsafe {
-        IO_EVENTS.output(ctx, &ev, 0);
-    }
+    });
 
     Ok(0)
 }
@@ -114,17 +121,13 @@ pub fn handle_sys_exit_open(ctx: &TracePointContext) -> Result<u32, i64> {
         return Ok(0);
     }
 
-    let ev = IoEvent {
+    emit_event(IoEvent {
         tgid,
         pid,
-        fd: ret as i32, // returned fd
+        fd: ret as i32,
         bytes: 0,
         kind: KIND_OPEN,
-    };
-
-    unsafe {
-        IO_EVENTS.output(ctx, &ev, 0);
-    }
+    });
 
     Ok(0)
 }
@@ -157,17 +160,13 @@ pub fn handle_sys_exit_no_bytes(ctx: &TracePointContext, kind: u8) -> Result<u32
         return Ok(0);
     }
 
-    let ev = IoEvent {
+    emit_event(IoEvent {
         tgid,
         pid,
         fd,
         bytes: 0,
         kind,
-    };
-
-    unsafe {
-        IO_EVENTS.output(ctx, &ev, 0);
-    }
+    });
 
     Ok(0)
 }

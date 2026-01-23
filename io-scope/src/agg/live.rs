@@ -88,6 +88,10 @@ impl Aggregator for LiveAggregator {
         self.update_state(event.ts);
     }
 
+    fn on_dropped(&mut self, count: u64) {
+        self.inner.on_dropped(count);
+    }
+
     fn on_end(&mut self) {
         self.is_running = false;
         self.inner.on_end();

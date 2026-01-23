@@ -8,6 +8,7 @@ use crate::model::{
 #[derive(Debug, Clone, Default)]
 pub struct TimeBin {
     pub syscalls: u64,
+    pub dropped: u64,
     pub bytes: u64,
     pub by_kind: HashMap<SyscallKind, SyscallStats>,
     pub by_path: HashMap<String, PathStats>,
@@ -65,6 +66,7 @@ impl TimeBin {
 #[derive(Debug, Clone, Default)]
 pub struct AggregatedTotals {
     pub total_syscalls: u64,
+    pub total_dropped: u64,
     pub total_bytes: u64,
     pub by_kind: HashMap<SyscallKind, SyscallStats>,
     pub by_path: HashMap<String, PathStats>,
@@ -81,6 +83,7 @@ impl AggregatedTotals {
         }
         AggregatedTotals {
             total_syscalls: result.syscalls,
+            total_dropped: result.dropped,
             total_bytes: result.bytes,
             by_kind: result.by_kind,
             by_path: result.by_path,

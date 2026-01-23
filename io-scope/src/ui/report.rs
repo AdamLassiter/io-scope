@@ -49,6 +49,7 @@ fn write_summary<W: fmt::Write>(out: &mut W, summary: &RunSummary) -> fmt::Resul
     writeln!(out, "Command:      {}", summary.cmdline)?;
     writeln!(out, "Duration:     {:.3}s", elapsed)?;
     writeln!(out, "Syscalls:     {}", summary.total_syscalls)?;
+    writeln!(out, "Dropped:      {}", summary.total_dropped)?;
     writeln!(out, "Sys. Rate:    {:.1} syscalls/s", syscall_rate)?;
     writeln!(out, "Bytes Rate:   {:.1} bytes/s", bytes_rate)?;
 

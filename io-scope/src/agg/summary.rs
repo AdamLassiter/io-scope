@@ -133,6 +133,7 @@ impl SummaryAggregator {
         RunSummary {
             cmdline: String::new(),
             total_syscalls: totals.total_syscalls,
+            total_dropped: totals.total_dropped,
             total_bytes: totals.total_bytes,
             start: Some(start),
             end: Some(end),
@@ -166,6 +167,14 @@ impl Aggregator for SummaryAggregator {
     fn on_event(&mut self, event: &SyscallEvent) {
         self.end = Some(event.ts);
         self.record_event(event);
+    }
+    
+    fn on_dropped(&mut self, count: u64) {
+        let Some(idx) = self.bin_index(OffsetDateTime::now_utc()) else {
+            return;
+        };
+        let bin = self.ensure_bin(idx);
+        bin.dropped += count;
     }
 
     fn on_end(&mut self) {

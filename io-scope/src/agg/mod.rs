@@ -11,6 +11,7 @@ pub trait Aggregator {
     fn on_start(&mut self);
     fn on_event(&mut self, event: &SyscallEvent);
     fn on_end(&mut self);
+    fn on_dropped(&mut self, count: u64);
     fn finalize(self) -> Self::Output;
     fn tick(&mut self) {}
 }
